@@ -3,9 +3,12 @@ description: 静默安装、启动、探活前后端、静默卸载，验证安�
 
 inputs:
   install-dir:
-    description: 测试用安装目录
+    description: |
+      测试用安装目录。默认值刻意带空格和括号：cmd 在解析 if (...) 块时会一并展开
+      %VAR%，路径里的 ) 会提前闭合代码块，之前 launcher.cmd 就是这样在
+      「C:\Program Files (x86)\...」下静默崩溃的，而无括号的测试目录测不出来。
     required: false
-    default: 'C:\mp-smoke-test'
+    default: 'C:\mp smoke (test)\MoviePilot-V2'
   boot-timeout:
     description: 等待后端就绪的秒数
     required: false
@@ -22,7 +25,8 @@ runs:
         $dir = "${{ inputs.install-dir }}"
 
         Write-Output "安装 $($setup.Name) -> $dir"
-        $proc = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$dir" -Wait -PassThru
+        # /DIR 必须自己带引号：Start-Process 只是用空格拼接 ArgumentList，不会为含空格的参数补引号
+        $proc = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`"" -Wait -PassThru
         if ($proc.ExitCode -ne 0) { throw "安装器退出码 $($proc.ExitCode)" }
 
         # 断言目录布局
@@ -58,8 +62,19 @@ runs:
       run: |
         $dir = "${{ inputs.install-dir }}"
 
-        # 直接跑 launcher.cmd 而非 .vbs，便于回收退出码
-        Start-Process -FilePath "$dir\launcher.cmd" -WindowStyle Hidden
+        # 走真机路径：快捷方式指向 .vbs，由它隐藏窗口拉起 launcher.cmd。
+        # 早期版本这里直接跑 launcher.cmd，vbs 这一环从未被覆盖过。
+        Start-Process -FilePath "$dir\MoviePilot.vbs"
+
+        # launcher.cmd 一进来就开日志，日志迟迟不出现说明 vbs 这一环就断了，
+        # 早报错好过等满 300 秒探活超时
+        $logFile = "$dir\config\launcher.log"
+        $logDeadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-Path $logFile) -and (Get-Date) -lt $logDeadline) {
+          Start-Sleep -Seconds 2
+        }
+        if (-not (Test-Path $logFile)) { throw "启动 30s 后仍无 $logFile，vbs 未能拉起 launcher.cmd" }
+        Write-Output "  ok  launcher.log 已生成"
 
         function Wait-Endpoint {
           param($Url, $TimeoutSec, $Label)
