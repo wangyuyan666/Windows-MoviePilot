@@ -16,53 +16,40 @@ jobs:
     steps:
       - name: 版本对比
         run: |
-          # 发送GET请求
-          $response = Invoke-WebRequest -Uri https://api.github.com/repos/developer-wlj/MoviePilot/git/refs/heads/v2 | ConvertFrom-Json
-          # echo $response.object.sha
-          $latest_commit_sha = $response.object.sha
-          echo $latest_commit_sha
-          # 获取倒数第二次提交的hash
-          $response1 = Invoke-WebRequest -Uri "https://api.github.com/repos/developer-wlj/MoviePilot/git/commits/$latest_commit_sha" | ConvertFrom-Json
-          $newArray = [System.Collections.ArrayList]::new()
-          # 遍历数组中的每个对象
-          foreach ($item in $response1.parents) {
-            # 获取每个对象的sha属性值
-            $sha = $item.sha
-            echo $sha
-            # 将sha属性值添加到新数组中
-            $newArray.Add($sha)
+          # 获取上游最新正式 release, /releases/latest 自动排除 draft 和 prerelease
+          $release = Invoke-WebRequest -Uri https://api.github.com/repos/jxxghp/MoviePilot/releases/latest | ConvertFrom-Json
+          $upstream_tag = $release.tag_name
+          Write-Output "上游最新 release: $upstream_tag"
+
+          # 解析 release tag 指向的 commit sha, 兼容 annotated tag 需要二次解引用
+          $ref = Invoke-WebRequest -Uri "https://api.github.com/repos/jxxghp/MoviePilot/git/ref/tags/$upstream_tag" | ConvertFrom-Json
+          $release_sha = $ref.object.sha
+          if ($ref.object.type -eq "tag") {
+            $tag_object = Invoke-WebRequest -Uri "https://api.github.com/repos/jxxghp/MoviePilot/git/tags/$release_sha" | ConvertFrom-Json
+            $release_sha = $tag_object.object.sha
           }
-          $response3 = Invoke-WebRequest -Uri https://api.github.com/repos/jxxghp/MoviePilot/git/refs/heads/v2 | ConvertFrom-Json
-          $jxxghp_version=$response3.object.sha
-          echo $jxxghp_version
-          if ($newArray -contains $jxxghp_version) {
-           # 获取所有发布版本
-           # $response4 = Invoke-WebRequest -Uri https://api.github.com/repos/developer-wlj/Windows-MoviePilot/releases | ConvertFrom-Json
-           $response4 = Invoke-WebRequest -Uri https://api.github.com/repos/developer-wlj/Windows-MoviePilot/releases/latest | ConvertFrom-Json
-           # 筛选出预发布版本
-           # $prereleases = $response4 | Where-Object { $_.prerelease -eq $true }
-           # 如果存在预发布版本，获取最新的一个
-           # if ($prereleases) {
-           if ($true) {
-               # $response5 = $prereleases | Sort-Object -Property published_at -Descending | Select-Object -First 1
-               # 提取tag_name的值
-               # $tagName = $response5.tag_name
-               $tagName = $response4.tag_name
-               echo $tagName
-               echo $jxxghp_version.Substring(0, 7)
-               if ($tagName.contains($jxxghp_version.Substring(0, 7))) {
-                 Write-Output "版本相同,无需更新"
-                 exit 1
-               } else {
-                 Write-Output "检测到新的commit 执行重新打包"
-               }
-           } else {
-               Write-Host "检测到新的commit 执行重新打包"
-           }
-          } else {
-           Write-Output "developer-wlj/MoviePilot与上游仓库有代码冲突或上游代码与本仓库版本不一致,等待定时同步"
-           exit 1
+          $short_sha = $release_sha.Substring(0, 7)
+          Write-Output "release commit: $release_sha ($short_sha)"
+
+          # 与本仓库已发布的最新版本对比, 首次发版时没有 release 会返回 404
+          $current_tag = ""
+          try {
+            $current = Invoke-WebRequest -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/latest" | ConvertFrom-Json
+            $current_tag = $current.tag_name
+          } catch {
+            Write-Output "本仓库暂无 release"
           }
+          Write-Output "本仓库最新 release: $current_tag"
+
+          if ($current_tag -and $current_tag.Contains($short_sha)) {
+            Write-Output "上游无新 release, 无需打包"
+            exit 1
+          }
+          Write-Output "检测到上游新 release $upstream_tag, 执行打包"
+
+          echo "UPSTREAM_TAG=$upstream_tag" >> $env:GITHUB_ENV
+          echo "HASH_VERSION=$short_sha" >> $env:GITHUB_ENV
+          echo "RELEASE_BODY=基于上游 release $upstream_tag ($short_sha) 打包 $($release.html_url)" >> $env:GITHUB_ENV
 
       - name: pull exe code
         uses: actions/checkout@v4
@@ -77,10 +64,49 @@ jobs:
       - name: pull server code
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.UPSTREAM_TAG }}
+          repository: jxxghp/MoviePilot
+          path: 'MoviePilot'
+          fetch-depth: 1
+
+      - name: pull windows patch
+        uses: actions/checkout@v4
+        with:
           ref: v2
           repository: developer-wlj/MoviePilot
-          path: 'MoviePilot'
-          fetch-depth: 2
+          path: 'MoviePilot-Windows-Patch'
+          fetch-depth: 1
+
+      - name: Apply windows patch
+        run: |
+          # 上游 release 代码不含 Windows 适配, 用 developer-wlj/MoviePilot 的对应文件覆盖
+          $patch_files = @(
+            "app/main.py",
+            "app/utils/system.py",
+            "app/core/config.py",
+            "app/helper/resource.py",
+            "app/chain/system.py",
+            "app/api/endpoints/system.py"
+          )
+          foreach ($file in $patch_files) {
+            $src = "MoviePilot-Windows-Patch/$file"
+            $dst = "MoviePilot/$file"
+            if (-not (Test-Path $src)) {
+              Write-Output "::error::补丁源文件缺失: $src"
+              exit 1
+            }
+            if (-not (Test-Path $dst)) {
+              Write-Output "::error::上游文件缺失, 目录结构可能已变更: $dst"
+              exit 1
+            }
+            # 打印差异, 上游改动这些文件时可据此判断补丁是否需要跟进
+            Write-Output "--- diff $file ---"
+            git diff --no-index --stat -- $dst $src
+            Copy-Item -Path $src -Destination $dst -Force
+            Write-Output "已应用 Windows 补丁: $file"
+          }
+          # git diff 检测到差异时返回 1, 避免污染本步骤退出码
+          exit 0
 
       - name: Init Python 3.12.8
         uses: actions/setup-python@v5
@@ -89,19 +115,10 @@ jobs:
           cache: 'pip'
 
       - name: Install dependent packages
-        id: INSTALL_PACKAGES
         run: |
           cd MoviePilot
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          $hash_version=(git log -2 --pretty=format:"%h" | Select-Object -Skip 1)
-          $GIT_LOG=(git log -2 --oneline | Select-Object -Last 1)
-          echo $GIT_LOG
-          echo "KEYM=$GIT_LOG" >> $env:GITHUB_OUTPUT
-          echo $hash_version
-          echo "HASH_VERSION=$hash_version" >> $env:GITHUB_ENV
-          echo $HASH_VERSION
-          cat $env:GITHUB_ENV
           cd app/helper
           $extract_url = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/sites.cp312-win_amd64.pyd"
           Invoke-WebRequest -URI $extract_url -OutFile "sites.cp312-win_amd64.pyd"
@@ -141,6 +158,10 @@ jobs:
           Remove-Item -Path "dist" -Recurse
           # 提取tag_name的值
           $tagName = $APP_VERSION.Substring(1)
+          # 校验 checkout 到的代码确实是目标 release
+          if ($APP_VERSION -ne $env:UPSTREAM_TAG) {
+            Write-Output "::warning::version.py 的 APP_VERSION ($APP_VERSION) 与 release tag ($env:UPSTREAM_TAG) 不一致"
+          }
           echo "FIRST_VERSION=$tagName" >> $env:GITHUB_ENV
           dir
           echo ("LATEST_VERSION="+"$tagName.$env:HASH_VERSION") >> $env:GITHUB_ENV
@@ -193,7 +214,7 @@ jobs:
         with:
           name: ${{ env.FIRST_VERSION }}.${{ env.SHANGHAI_TIMEZONE }}.${{ env.HASH_VERSION }}
           tag_name: ${{ env.FIRST_VERSION }}.${{ env.HASH_VERSION }}
-          body: ${{ steps.INSTALL_PACKAGES.outputs.KEYM }}
+          body: ${{ env.RELEASE_BODY }}
           draft: false
           prerelease: false
           make_latest: true

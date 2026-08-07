@@ -24,16 +24,13 @@ TG交流群: https://t.me/+o7RfmjHOf183OGM1
 - v2和v1可以共存 (❗注意: v2安装时不要和v1安装在同一目录)
 
 ### 版本命名规则
-如 "1.1.0.d0a586a" 
-- 1.1.0 指的是原MoviePilot仓库 发布的版本号
-- d0a586a 指的是 原MoviePilot仓库 最近一次提交代码的hash
-- 每间隔4小时,自动发一次版
-- 自动发版可能会打进去新的bug(类似于docker版自动升级dev拉取)
-- 因此推荐找对应原项目最新Releases的版本
-- 如 原项目最新版本1.9.7 在commit为0fb12c7的地方进行的打包
-  ![image](https://github.com/developer-wlj/Windows-MoviePilot/assets/55836679/d0c5f884-9e0d-46a3-9044-0327903eddfb)
-  ![image](https://github.com/developer-wlj/Windows-MoviePilot/assets/55836679/53591f14-94aa-4cda-968c-c23bf97fe0ae)
-- 那就在本项目找后缀为0fb12c7发行的版本,如果找不到就向上找离0fb12c7最近的提交
+如 "2.15.5.d0a586a"
+- 2.15.5 指的是 原MoviePilot仓库 发布的 Release 版本号
+- d0a586a 指的是 该 Release 对应的 commit hash
+- 每间隔4小时检查一次 [原项目 Releases](https://github.com/jxxghp/MoviePilot/releases), 只有出现新的正式 Release 才会自动打包发版
+- prerelease 和 draft 不会被打包
+- 本项目的每个版本都一一对应上游的一个正式 Release, 不再跟随 v2 分支的滚动提交, 因此不会打进上游未发版的代码
+- 打包时以上游 Release 源码为准, 并自动覆盖 developer-wlj/MoviePilot 中的 Windows 适配文件 (app/main.py、app/utils/system.py 等 6 个文件)
   
 ### 如何运行
 Windows-MoviePilot-V2内置Python3.12环境,需要注意是Python3.12不支持Win7及之前的老系统,还有系统必须是64位  
