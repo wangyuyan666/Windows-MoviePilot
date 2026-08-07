@@ -12,6 +12,7 @@ jobs:
 
     steps:
       - name: 版本对比
+        id: check
         run: |
           # 获取上游最新正式 release, /releases/latest 自动排除 draft 和 prerelease
           $release = Invoke-WebRequest -Uri https://api.github.com/repos/jxxghp/MoviePilot/releases/latest | ConvertFrom-Json
@@ -38,23 +39,28 @@ jobs:
           }
           Write-Output "本仓库最新 release: $current_tag"
 
+          # 无新 release 时正常结束, 靠 skip 输出跳过后续步骤, 避免定时任务留下失败记录
           if ($current_tag -and $current_tag.Contains($short_sha)) {
             Write-Output "上游无新 release, 无需打包"
-            exit 1
+            echo "skip=true" >> $env:GITHUB_OUTPUT
+            exit 0
           }
           Write-Output "检测到上游新 release $upstream_tag, 执行打包"
 
+          echo "skip=false" >> $env:GITHUB_OUTPUT
           echo "UPSTREAM_TAG=$upstream_tag" >> $env:GITHUB_ENV
           echo "HASH_VERSION=$short_sha" >> $env:GITHUB_ENV
           echo "RELEASE_BODY=基于上游 release $upstream_tag ($short_sha) 打包 $($release.html_url)" >> $env:GITHUB_ENV
 
       - name: 拉取打包脚本
+        if: steps.check.outputs.skip == 'false'
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: 构建安装包
         id: build
+        if: steps.check.outputs.skip == 'false'
         uses: ./.github/actions/build-package
         with:
           upstream-tag: ${{ env.UPSTREAM_TAG }}
@@ -62,9 +68,11 @@ jobs:
 
       # 装不上、起不来的包不发布
       - name: 冒烟测试
+        if: steps.check.outputs.skip == 'false'
         uses: ./.github/actions/smoke-test
 
       - name: 取当前时间
+        if: steps.check.outputs.skip == 'false'
         run: |
           $currentUtcTime = (Get-Date).ToUniversalTime()
           $shanghaiTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("China Standard Time")
@@ -73,6 +81,7 @@ jobs:
           echo "SHANGHAI_TIMEZONE=$formattedShanghaiTime" >> $env:GITHUB_ENV
 
       - name: 创建 release 并上传安装包
+        if: steps.check.outputs.skip == 'false'
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ steps.build.outputs.app-version }}.${{ env.SHANGHAI_TIMEZONE }}.${{ env.HASH_VERSION }}
