@@ -37,15 +37,32 @@ if not exist "%SERVER_DIR%\app\main.py" (
 rem Clear a stale instance left by an unclean shutdown. Scoped to our own
 rem prefix, so a user's separately installed nginx is never touched.
 "%NGINX_DIR%\nginx.exe" -p "%NGINX_DIR%" -c conf\nginx.conf -s quit >nul 2>&1
+if exist "%NGINX_DIR%\logs\nginx.pid" del /q "%NGINX_DIR%\logs\nginx.pid" >nul 2>&1
 
-"%NGINX_DIR%\nginx.exe" -p "%NGINX_DIR%" -c conf\nginx.conf
-if errorlevel 1 (
-    echo [ERROR] nginx failed to start, see %NGINX_DIR%\logs\error.log
+rem nginx for Windows holds the console instead of daemonising, so it has to
+rem be detached with `start /b` or the backend below would never run.
+start "" /b "%NGINX_DIR%\nginx.exe" -p "%NGINX_DIR%" -c conf\nginx.conf
+
+rem The pid file is the only reliable readiness signal here: `start` returns
+rem immediately and reports its own exit code, not nginx's.
+set /a NGINX_WAIT=0
+:wait_nginx
+if exist "%NGINX_DIR%\logs\nginx.pid" goto nginx_ready
+if %NGINX_WAIT% GEQ 20 (
+    echo [ERROR] nginx did not start, see %NGINX_DIR%\logs\error.log
     exit /b 1
 )
+set /a NGINX_WAIT+=1
+rem ping instead of timeout: timeout aborts when stdin is redirected
+ping -n 2 127.0.0.1 >nul 2>&1
+goto wait_nginx
+:nginx_ready
 
 cd /d "%SERVER_DIR%"
-"%PYTHON_EXE%" app\main.py
+rem Capture startup failures (import errors and the like) that happen before
+rem MoviePilot's own logging is initialised, otherwise they vanish with the
+rem hidden console.
+"%PYTHON_EXE%" app\main.py >> "%CONFIG_DIR%\launcher.log" 2>&1
 set "BACKEND_EXIT=%ERRORLEVEL%"
 
 "%NGINX_DIR%\nginx.exe" -p "%NGINX_DIR%" -c conf\nginx.conf -s quit >nul 2>&1

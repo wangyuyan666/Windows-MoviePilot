@@ -103,12 +103,21 @@ runs:
       shell: pwsh
       run: |
         $dir = "${{ inputs.install-dir }}"
-        foreach ($log in @("$dir\Nginx\logs\error.log", "$dir\config\logs\moviepilot.log")) {
+        # launcher.log 优先：后端在日志系统初始化前崩溃时，只有它有内容
+        foreach ($log in @("$dir\config\launcher.log", "$dir\Nginx\logs\error.log", "$dir\config\logs\moviepilot.log")) {
           if (Test-Path $log) {
             Write-Output "===== $log (末尾 60 行) ====="
             Get-Content $log -Tail 60
+          } else {
+            Write-Output "===== $log 不存在 ====="
           }
         }
+
+        # 进程是否还活着，用于区分「没起来」和「起来了但没监听」
+        Write-Output "===== 安装目录下的进程 ====="
+        Get-Process -Name nginx, python, pythonw -ErrorAction SilentlyContinue |
+          Where-Object { $_.Path -and $_.Path.StartsWith($dir, [System.StringComparison]::OrdinalIgnoreCase) } |
+          Format-Table Id, ProcessName, Path -AutoSize | Out-String | Write-Output
 
     - name: 停止实例
       if: always()
