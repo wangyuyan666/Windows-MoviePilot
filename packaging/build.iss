@@ -29,10 +29,14 @@ AppSupportURL={#MyAppURL}
 VersionInfoVersion=0.0.0.0
 VersionInfoTextVersion={#MyAppVersion}
 
-; 不申请管理员权限：提权后看不到普通用户挂载的网络盘符（SMB/WebDAV）。
-; 用户仍可在安装向导中手动切换为全局安装。
+; 全程不提权，两个原因：
+;   1. 提权后看不到普通用户挂载的网络盘符（SMB/WebDAV）。
+;   2. 运行期的 config\user.db、Nginx\logs 等都写在安装目录里，而启动器是普通
+;      用户身份运行的。装进 C:\Program Files 会在启动后才炸（SQLite 报
+;      unable to open database file），所以不提供全局安装选项。
+; 因此这里没有 PrivilegesRequiredOverridesAllowed，{autopf} 恒等于
+; %LOCALAPPDATA%\Programs，当前用户可写。
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
@@ -54,6 +58,10 @@ WizardStyle=modern
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[CustomMessages]
+chinesesimplified.DirNotWritable=当前用户无法写入所选目录：%n%n%1%n%nMoviePilot 以普通用户权限运行，配置和数据库都保存在安装目录中，请改选一个可写的位置（如默认目录）。
+english.DirNotWritable=The current user cannot write to the selected folder:%n%n%1%n%nMoviePilot runs without elevation and keeps its configuration and database inside the install folder. Choose a writable location (for example the default one).
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
@@ -126,6 +134,49 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   StopRunningInstance();
   Result := '';
+end;
+
+{
+  安装目录必须对当前用户可写：user.db / launcher.log / Nginx\logs 都写在安装
+  目录里，而启动器不提权。用户仍可在向导里手打 C:\Program Files\... 之类的只读
+  路径，那种情况下要到首次启动才报错。这里用一次真实写入探测，在选目录那一步
+  就拦掉。
+
+  注意：本注释块内不能出现右花括号，Pascal 注释会被它提前闭合。
+}
+function DirIsWritable(Dir: String): Boolean;
+var
+  Probe: String;
+  Created: Boolean;
+begin
+  Created := not DirExists(Dir);
+  if Created then begin
+    if not ForceDirectories(Dir) then begin
+      Result := False;
+      Exit;
+    end;
+  end;
+
+  Probe := AddBackslash(Dir) + 'mp_write_test.tmp';
+  Result := SaveStringToFile(Probe, 'x', False);
+  if Result then
+    DeleteFile(Probe);
+
+  { 探测过程中新建的目录不留下来；ForceDirectories 若建了多级，这里只删末级，
+    但那种情况下目录本来就可写，安装马上会重新建出来。 }
+  if Created then
+    RemoveDir(Dir);
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if CurPageID = wpSelectDir then begin
+    if not DirIsWritable(WizardDirValue) then begin
+      MsgBox(FmtMessage(CustomMessage('DirNotWritable'), [WizardDirValue]), mbError, MB_OK);
+      Result := False;
+    end;
+  end;
 end;
 
 function InitializeUninstall(): Boolean;
