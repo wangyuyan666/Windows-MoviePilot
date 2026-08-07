@@ -1,0 +1,140 @@
+name: Smoke test MoviePilot installer
+description: 静默安装、启动、探活前后端、静默卸载，验证安装包可用
+
+inputs:
+  install-dir:
+    description: 测试用安装目录
+    required: false
+    default: 'C:\mp-smoke-test'
+  boot-timeout:
+    description: 等待后端就绪的秒数
+    required: false
+    default: '300'
+
+runs:
+  using: composite
+  steps:
+    - name: 静默安装
+      shell: pwsh
+      run: |
+        $setup = Get-ChildItem -Path "exe/build" -Filter "*.exe" | Select-Object -First 1
+        if (-not $setup) { throw "找不到安装器" }
+        $dir = "${{ inputs.install-dir }}"
+
+        Write-Output "安装 $($setup.Name) -> $dir"
+        $proc = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$dir" -Wait -PassThru
+        if ($proc.ExitCode -ne 0) { throw "安装器退出码 $($proc.ExitCode)" }
+
+        # 断言目录布局
+        $expected = @(
+          "$dir\MoviePilot.vbs",
+          "$dir\launcher.cmd",
+          "$dir\config\app.env",
+          "$dir\Python\python.exe",
+          "$dir\MoviePilot\app\main.py",
+          "$dir\MoviePilot\app.ico",
+          "$dir\MoviePilot\app\helper\sites.cp312-win_amd64.pyd",
+          "$dir\Nginx\nginx.exe",
+          "$dir\Nginx\conf\nginx.conf",
+          "$dir\Nginx\conf\common.conf",
+          "$dir\Nginx\html\MoviePilot-Frontend\index.html"
+        )
+        foreach ($path in $expected) {
+          if (-not (Test-Path $path)) { throw "安装后缺少: $path" }
+          Write-Output "  ok  $path"
+        }
+
+    - name: 校验补丁已生效
+      shell: pwsh
+      run: |
+        $dir = "${{ inputs.install-dir }}"
+        $main = Get-Content -Raw "$dir\MoviePilot\app\main.py"
+        if ($main -notmatch "sys\.path\.insert") { throw "补丁 1 未生效: main.py 缺少 sys.path 引导" }
+        if ($main -match "if not SystemUtils\.is_frozen\(\):\s*\r?\n\s*return") { throw "补丁 2 未生效: 托盘仍受 frozen 限制" }
+        Write-Output "两处 Windows 补丁均已生效"
+
+    - name: 启动并探活
+      shell: pwsh
+      run: |
+        $dir = "${{ inputs.install-dir }}"
+
+        # 直接跑 launcher.cmd 而非 .vbs，便于回收退出码
+        Start-Process -FilePath "$dir\launcher.cmd" -WindowStyle Hidden
+
+        function Wait-Endpoint {
+          param($Url, $TimeoutSec, $Label)
+          $deadline = (Get-Date).AddSeconds($TimeoutSec)
+          while ((Get-Date) -lt $deadline) {
+            try {
+              $res = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5
+              if ($res.StatusCode -eq 200) {
+                Write-Output "  ok  $Label -> 200 ($Url)"
+                return $true
+              }
+            } catch {
+              Start-Sleep -Seconds 5
+            }
+          }
+          return $false
+        }
+
+        $timeout = [int]"${{ inputs.boot-timeout }}"
+
+        # 后端直连，openapi.json 无需鉴权
+        if (-not (Wait-Endpoint "http://127.0.0.1:3111/api/v1/openapi.json" $timeout "后端 API")) {
+          throw "后端在 ${timeout}s 内未就绪"
+        }
+        # 前端静态页
+        if (-not (Wait-Endpoint "http://127.0.0.1:3333/" 60 "前端页面")) {
+          throw "nginx 未正常提供前端页面"
+        }
+        # 经 nginx 反代到后端，验证 upstream 配置
+        if (-not (Wait-Endpoint "http://127.0.0.1:3333/api/v1/openapi.json" 60 "nginx 反代")) {
+          throw "nginx 到后端的反向代理不通"
+        }
+
+        # 首次运行应生成用户数据
+        foreach ($path in @("$dir\config\logs", "$dir\config\user.db")) {
+          if (-not (Test-Path $path)) { Write-Output "::warning::首次运行未生成 $path" }
+        }
+
+    - name: 输出日志
+      if: always()
+      shell: pwsh
+      run: |
+        $dir = "${{ inputs.install-dir }}"
+        foreach ($log in @("$dir\Nginx\logs\error.log", "$dir\config\logs\moviepilot.log")) {
+          if (Test-Path $log) {
+            Write-Output "===== $log (末尾 60 行) ====="
+            Get-Content $log -Tail 60
+          }
+        }
+
+    - name: 停止实例
+      if: always()
+      shell: pwsh
+      run: |
+        $dir = "${{ inputs.install-dir }}"
+        Get-Process -Name nginx, python, pythonw -ErrorAction SilentlyContinue |
+          Where-Object { $_.Path -and $_.Path.StartsWith($dir, [System.StringComparison]::OrdinalIgnoreCase) } |
+          Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+
+    - name: 静默卸载
+      shell: pwsh
+      run: |
+        $dir = "${{ inputs.install-dir }}"
+        $unins = Get-ChildItem -Path $dir -Filter "unins*.exe" | Select-Object -First 1
+        if (-not $unins) { throw "找不到卸载程序" }
+
+        $proc = Start-Process $unins.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+        if ($proc.ExitCode -ne 0) { throw "卸载程序退出码 $($proc.ExitCode)" }
+        Start-Sleep -Seconds 5
+
+        # 程序文件应被清理
+        foreach ($path in @("$dir\Python\python.exe", "$dir\Nginx\nginx.exe", "$dir\MoviePilot\app\main.py")) {
+          if (Test-Path $path) { throw "卸载后残留: $path" }
+        }
+        # 用户配置必须保留
+        if (-not (Test-Path "$dir\config\app.env")) { throw "卸载删掉了用户配置 config\app.env" }
+        Write-Output "卸载正常，用户配置已保留"

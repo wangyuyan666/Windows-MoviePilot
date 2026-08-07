@@ -1,0 +1,151 @@
+name: Build MoviePilot Windows package
+description: 拉取上游 release 源码、安装依赖、组装便携运行环境并编译 Inno Setup 安装器
+
+# 调用方需先 checkout 本仓库（packaging/ 目录必须已存在于工作区根目录）。
+
+inputs:
+  upstream-tag:
+    description: 上游 release tag，如 v2.15.5
+    required: true
+  hash-version:
+    description: release commit 短 hash，用于拼接版本号
+    required: true
+  python-version:
+    description: 便携 Python 版本
+    required: false
+    default: '3.12.8'
+  nginx-version:
+    description: nginx Windows 版本
+    required: false
+    default: '1.28.1'
+  inno-version:
+    description: Inno Setup 版本，同时决定中文语言包的下载 tag
+    required: false
+    default: '6.7.3'
+
+outputs:
+  version:
+    description: 完整版本号 <APP_VERSION>.<hash>
+    value: ${{ steps.frontend.outputs.version }}
+  app-version:
+    description: 上游 APP_VERSION（去掉前缀 v）
+    value: ${{ steps.frontend.outputs.app-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: 拉取上游 release 源码
+      uses: actions/checkout@v4
+      with:
+        repository: jxxghp/MoviePilot
+        ref: ${{ inputs.upstream-tag }}
+        path: 'MoviePilot'
+        fetch-depth: 1
+
+    - name: 应用 Windows 补丁
+      shell: pwsh
+      run: ./packaging/apply-windows-patch.ps1 -Root MoviePilot
+
+    - name: 初始化 Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: 'pip'
+
+    - name: 安装依赖与资源包
+      shell: pwsh
+      working-directory: MoviePilot
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+        # 站点认证组件，仅随安装包分发（app.env 中已关闭在线更新）
+        cd app/helper
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/sites.cp312-win_amd64.pyd" -OutFile "sites.cp312-win_amd64.pyd"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/user.sites.v2.bin" -OutFile "user.sites.v2.bin"
+
+        # 官方插件市场
+        cd ../plugins/
+        Invoke-WebRequest -Uri "https://github.com/jxxghp/MoviePilot-Plugins/archive/refs/heads/main.zip" -OutFile "MoviePilot-Plugins-main.zip"
+        Expand-Archive -Path "MoviePilot-Plugins-main.zip" -DestinationPath "MoviePilot-Plugins-main"
+        Move-Item -Path "MoviePilot-Plugins-main/MoviePilot-Plugins-main/plugins.v2/*" -Destination . -Force
+        Remove-Item "clashruleprovider" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "MoviePilot-Plugins-main.zip"
+        Remove-Item -Path "MoviePilot-Plugins-main" -Recurse -Force
+        Get-ChildItem -Path . -Recurse -Filter "requirements.txt" | ForEach-Object { pip install -r $_ }
+
+    - name: 组装 nginx 与前端
+      id: frontend
+      shell: pwsh
+      run: |
+        # 前端版本由上游 version.py 指定，与后端严格对应
+        $versionFile = Get-Content "./MoviePilot/version.py"
+        $FRONTEND_VERSION = ($versionFile | Select-String "FRONTEND_VERSION" | ForEach-Object { $_.ToString().Split('=')[1] }).Trim() -replace "'", "" -replace '"', ""
+        $APP_VERSION = ($versionFile | Select-String "APP_VERSION" | ForEach-Object { $_.ToString().Split('=')[1] }).Trim() -replace "'", "" -replace '"', ""
+        Write-Output "FRONTEND_VERSION: $FRONTEND_VERSION"
+        Write-Output "APP_VERSION: $APP_VERSION"
+
+        if ($APP_VERSION -ne "${{ inputs.upstream-tag }}") {
+          Write-Output "::warning::version.py 的 APP_VERSION ($APP_VERSION) 与 release tag (${{ inputs.upstream-tag }}) 不一致"
+        }
+
+        # nginx 官方 Windows 版
+        $nginxZip = "nginx-${{ inputs.nginx-version }}.zip"
+        Invoke-WebRequest -Uri "https://nginx.org/download/$nginxZip" -OutFile $nginxZip
+        Expand-Archive -Path $nginxZip -DestinationPath "nginx-tmp"
+        Move-Item -Path "nginx-tmp/nginx-${{ inputs.nginx-version }}" -Destination "Nginx"
+        Remove-Item -Path $nginxZip, "nginx-tmp" -Recurse -Force
+
+        # 替换为本项目的配置（监听 3333，反代 3111）
+        Copy-Item -Path "packaging/nginx/nginx.conf" -Destination "Nginx/conf/nginx.conf" -Force
+        Copy-Item -Path "packaging/nginx/common.conf" -Destination "Nginx/conf/common.conf" -Force
+
+        # 前端 dist 放进 nginx 的 html 目录
+        New-Item -ItemType Directory -Path "Nginx/html/MoviePilot-Frontend" -Force | Out-Null
+        Invoke-WebRequest -Uri "https://github.com/jxxghp/MoviePilot-Frontend/releases/download/$FRONTEND_VERSION/dist.zip" -OutFile "dist.zip"
+        Expand-Archive -Path "dist.zip" -DestinationPath "frontend-tmp"
+        Move-Item -Path "frontend-tmp/dist/*" -Destination "Nginx/html/MoviePilot-Frontend" -Force
+        Remove-Item -Path "dist.zip", "frontend-tmp" -Recurse -Force
+
+        if (-not (Test-Path "Nginx/html/MoviePilot-Frontend/index.html")) {
+          Write-Output "::error::前端解压后缺少 index.html"
+          exit 1
+        }
+
+        $shortVersion = $APP_VERSION.Substring(1)
+        echo "app-version=$shortVersion" >> $env:GITHUB_OUTPUT
+        echo "version=$shortVersion.${{ inputs.hash-version }}" >> $env:GITHUB_OUTPUT
+
+    - name: 打包便携 Python 运行时
+      shell: pwsh
+      run: |
+        $python_dir = $(python -c "import os; print(os.path.dirname(os.__file__))")
+        $python_root_dir = $python_dir.Substring(0, $python_dir.Length - 4)
+        New-Item -ItemType Directory -Path "Python" -Force | Out-Null
+        Copy-Item -Path "$python_root_dir/*" -Destination "Python" -Recurse -Force
+        if (-not (Test-Path "Python/python.exe")) {
+          Write-Output "::error::便携 Python 缺少 python.exe"
+          exit 1
+        }
+
+    - name: 编译 Inno Setup 安装器
+      shell: pwsh
+      run: |
+        $version = "${{ inputs.inno-version }}"
+        $tag = "is-" + $version.Replace('.', '_')
+        $innoDir = "$env:RUNNER_TEMP\inno"
+
+        Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$version.exe" -OutFile "is.exe"
+        Start-Process is.exe -ArgumentList "/VERYSILENT", "/NORESTART", "/SP-", "/SUPPRESSMSGBOXES", "/DIR=$innoDir" -NoNewWindow -Wait
+
+        # 简体中文是非官方翻译，Inno 安装包不含，需按同一 tag 单独取
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/$tag/Files/Languages/Unofficial/ChineseSimplified.isl" -OutFile "$innoDir\Languages\ChineseSimplified.isl"
+
+        & "$innoDir\iscc.exe" "/DMyAppVersion=${{ steps.frontend.outputs.version }}" "packaging\build.iss"
+
+        $setup = Get-ChildItem -Path "exe/build" -Filter "*.exe" | Select-Object -First 1
+        if (-not $setup) {
+          Write-Output "::error::未生成安装器"
+          exit 1
+        }
+        Write-Output "安装器: $($setup.FullName) ($([math]::Round($setup.Length / 1MB, 1)) MB)"

@@ -1,0 +1,70 @@
+name: Test Package
+
+# 验证打包脚本本身：构建 + 冒烟测试，但不发版。
+# 安装器作为 artifact 上传，可下载到真机手动验证托盘、快捷方式等 CI 覆盖不到的部分。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream-tag:
+        description: '要打包的上游 release tag，留空则用最新正式 release'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/actions/**'
+      - '.github/workflows/test_package.yml'
+      - '.github/workflows/build_v2.yml'
+
+jobs:
+  test:
+    runs-on: windows-latest
+
+    steps:
+      - name: 解析上游 release
+        run: |
+          $input_tag = "${{ inputs.upstream-tag }}"
+          if ($input_tag) {
+            $upstream_tag = $input_tag
+            $release = Invoke-WebRequest -Uri "https://api.github.com/repos/jxxghp/MoviePilot/releases/tags/$upstream_tag" | ConvertFrom-Json
+            Write-Output "使用指定 release: $upstream_tag"
+          } else {
+            $release = Invoke-WebRequest -Uri https://api.github.com/repos/jxxghp/MoviePilot/releases/latest | ConvertFrom-Json
+            $upstream_tag = $release.tag_name
+            Write-Output "使用最新 release: $upstream_tag"
+          }
+
+          $ref = Invoke-WebRequest -Uri "https://api.github.com/repos/jxxghp/MoviePilot/git/ref/tags/$upstream_tag" | ConvertFrom-Json
+          $release_sha = $ref.object.sha
+          if ($ref.object.type -eq "tag") {
+            $tag_object = Invoke-WebRequest -Uri "https://api.github.com/repos/jxxghp/MoviePilot/git/tags/$release_sha" | ConvertFrom-Json
+            $release_sha = $tag_object.object.sha
+          }
+
+          echo "UPSTREAM_TAG=$upstream_tag" >> $env:GITHUB_ENV
+          echo "HASH_VERSION=$($release_sha.Substring(0, 7))" >> $env:GITHUB_ENV
+
+      - name: 拉取打包脚本
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 构建安装包
+        id: build
+        uses: ./.github/actions/build-package
+        with:
+          upstream-tag: ${{ env.UPSTREAM_TAG }}
+          hash-version: ${{ env.HASH_VERSION }}
+
+      - name: 冒烟测试
+        uses: ./.github/actions/smoke-test
+
+      - name: 上传安装包供人工验证
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoviePilot-V2-${{ steps.build.outputs.version }}
+          path: ./exe/build/*.exe
+          if-no-files-found: warn
+          retention-days: 14

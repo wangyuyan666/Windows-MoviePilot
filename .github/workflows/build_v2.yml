@@ -3,9 +3,6 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 0/4 * * *'
-env:
-  REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-  REPO: ${{ secrets.REPO }}
 
 jobs:
   Windows-build:
@@ -51,169 +48,35 @@ jobs:
           echo "HASH_VERSION=$short_sha" >> $env:GITHUB_ENV
           echo "RELEASE_BODY=基于上游 release $upstream_tag ($short_sha) 打包 $($release.html_url)" >> $env:GITHUB_ENV
 
-      - name: pull exe code
+      - name: 拉取打包脚本
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: v2
-          repository: ${{ secrets.REPO }}
-          ssh-key: ${{ secrets.DEPLOY_KEY }}
-          path: 'Inno-Setup-MoviePilot'
           fetch-depth: 1
 
-      - name: pull server code
-        uses: actions/checkout@v4
+      - name: 构建安装包
+        id: build
+        uses: ./.github/actions/build-package
         with:
-          ref: ${{ env.UPSTREAM_TAG }}
-          repository: jxxghp/MoviePilot
-          path: 'MoviePilot'
-          fetch-depth: 1
+          upstream-tag: ${{ env.UPSTREAM_TAG }}
+          hash-version: ${{ env.HASH_VERSION }}
 
-      - name: pull windows patch
-        uses: actions/checkout@v4
-        with:
-          ref: v2
-          repository: developer-wlj/MoviePilot
-          path: 'MoviePilot-Windows-Patch'
-          fetch-depth: 1
+      # 装不上、起不来的包不发布
+      - name: 冒烟测试
+        uses: ./.github/actions/smoke-test
 
-      - name: Apply windows patch
-        run: |
-          # 上游 release 代码不含 Windows 适配, 用 developer-wlj/MoviePilot 的对应文件覆盖
-          $patch_files = @(
-            "app/main.py",
-            "app/utils/system.py",
-            "app/core/config.py",
-            "app/helper/resource.py",
-            "app/chain/system.py",
-            "app/api/endpoints/system.py"
-          )
-          foreach ($file in $patch_files) {
-            $src = "MoviePilot-Windows-Patch/$file"
-            $dst = "MoviePilot/$file"
-            if (-not (Test-Path $src)) {
-              Write-Output "::error::补丁源文件缺失: $src"
-              exit 1
-            }
-            if (-not (Test-Path $dst)) {
-              Write-Output "::error::上游文件缺失, 目录结构可能已变更: $dst"
-              exit 1
-            }
-            # 打印差异, 上游改动这些文件时可据此判断补丁是否需要跟进
-            Write-Output "--- diff $file ---"
-            git diff --no-index --stat -- $dst $src
-            Copy-Item -Path $src -Destination $dst -Force
-            Write-Output "已应用 Windows 补丁: $file"
-          }
-          # git diff 检测到差异时返回 1, 避免污染本步骤退出码
-          exit 0
-
-      - name: Init Python 3.12.8
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12.8'
-          cache: 'pip'
-
-      - name: Install dependent packages
-        run: |
-          cd MoviePilot
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          cd app/helper
-          $extract_url = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/sites.cp312-win_amd64.pyd"
-          Invoke-WebRequest -URI $extract_url -OutFile "sites.cp312-win_amd64.pyd"
-          $extract_url1 = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/user.sites.v2.bin"
-          Invoke-WebRequest -URI $extract_url1 -OutFile "user.sites.v2.bin"
-          cd ../plugins/
-          Invoke-WebRequest -Uri "https://github.com/jxxghp/MoviePilot-Plugins/archive/refs/heads/main.zip" -OutFile "MoviePilot-Plugins-main.zip"
-          Expand-Archive -Path "MoviePilot-Plugins-main.zip" -DestinationPath "MoviePilot-Plugins-main"
-          Move-Item -Path "MoviePilot-Plugins-main/MoviePilot-Plugins-main/plugins.v2/*" -Destination . -Force
-          Remove-Item "clashruleprovider" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item -Path "MoviePilot-Plugins-main.zip"
-          Remove-Item -Path "MoviePilot-Plugins-main" -Recurse -Force
-          Get-ChildItem -Path . -Recurse -Filter "requirements.txt" | ForEach-Object { pip install -r $_ }
-
-      - name: Download MoviePilot Frontend
-        run: |
-          $FRONTEND_VERSION = Get-Content "./MoviePilot/version.py" | Select-String "FRONTEND_VERSION" | ForEach-Object {$_.ToString().Split('=')[1] }
-          $APP_VERSION = Get-Content "./MoviePilot/version.py" | Select-String "APP_VERSION" | ForEach-Object {$_.ToString().Split('=')[1] }
-          # 去除可能存在的单双引号和前后空格
-          $FRONTEND_VERSION =$FRONTEND_VERSION.Trim() -replace "'", "" -replace '"', ""
-          $APP_VERSION =$APP_VERSION.Trim() -replace "'", "" -replace '"', ""
-          # 输出 FRONTEND_VERSION 的值
-          echo "FRONTEND_VERSION: $FRONTEND_VERSION"
-          echo "APP_VERSION: $APP_VERSION"
-          mkdir MoviePilot-Frontend
-          cd MoviePilot-Frontend
-          $extract_url = "https://github.com/jxxghp/MoviePilot-Frontend/releases/download/$FRONTEND_VERSION/dist.zip"
-          Write-Host "前端 Downloading..."
-          # 下载
-          Invoke-WebRequest -URI $extract_url -OutFile dist.zip
-          dir
-          Write-Host "Extracting zip"
-          # 解压
-          Expand-Archive dist.zip -DestinationPath .
-          Move-Item -Path .\dist\* -Destination . -Force
-          Remove-Item -Path "dist.zip"
-          Remove-Item -Path "dist" -Recurse
-          # 提取tag_name的值
-          $tagName = $APP_VERSION.Substring(1)
-          # 校验 checkout 到的代码确实是目标 release
-          if ($APP_VERSION -ne $env:UPSTREAM_TAG) {
-            Write-Output "::warning::version.py 的 APP_VERSION ($APP_VERSION) 与 release tag ($env:UPSTREAM_TAG) 不一致"
-          }
-          echo "FIRST_VERSION=$tagName" >> $env:GITHUB_ENV
-          dir
-          echo ("LATEST_VERSION="+"$tagName.$env:HASH_VERSION") >> $env:GITHUB_ENV
-          echo $LATEST_VERSION
-
-      - name: Make Python package
-        id: Make_Python_package
-        run: |
-          echo $env:LATEST_VERSION
-          echo "KEY=$env:LATEST_VERSION" >> $env:GITHUB_OUTPUT
-          cat $env:GITHUB_OUTPUT
-          echo 999
-          $python_dir=$(python -c "import os; print(os.path.dirname(os.__file__))")
-          $python_root_dir=$python_dir.Substring(0, $python_dir.Length - 4)
-          mkdir Python3.11
-          cd Python3.11
-          cp -r $python_root_dir/* .
-
-      - name: Compile Inno Setup Script
-        run: |
-          echo 999
-          echo ${{ steps.Make_Python_package.outputs.KEY }}
-          echo 888
-          echo "${{ steps.Make_Python_package.outputs.KEY }}"
-          echo 999
-          echo $env:LATEST_VERSION
-          dir
-          Invoke-WebRequest https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe -OutFile is.exe
-          Start-Process is.exe -ArgumentList "/VERYSILENT", "/NORETART", "/SP-","/SUPPRESSMSGBOXES","/DIR=C:\Users\runneradmin\AppData\Local\Temp\inno" -NoNewWindow -Wait
-          cd Inno-Setup-MoviePilot
-          Copy-Item -Path ".\ChineseSimplified.isl" -Destination "C:\Users\runneradmin\AppData\Local\Temp\inno\Languages"
-          echo $env:FIRST_VERSION
-          echo $env:HASH_VERSION
-          echo "$env:FIRST_VERSION.$env:HASH_VERSION"
-          echo $env:LATEST_VERSION
-          # iscc /DAppVersion="$env:FIRST_VERSION.$env:HASH_VERSION" build.iss
-          C:\Users\runneradmin\AppData\Local\Temp\inno\iscc "/DMyAppVersion=$env:LATEST_VERSION" build.iss
-
-      - name: Use current time
+      - name: 取当前时间
         run: |
           $currentUtcTime = (Get-Date).ToUniversalTime()
           $shanghaiTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("China Standard Time")
           $shanghaiTime = [System.TimeZoneInfo]::ConvertTimeFromUtc($currentUtcTime, $shanghaiTimeZone)
           $formattedShanghaiTime = $shanghaiTime.ToString("yyyyMMddHHmmss")
-          echo "Formatted time in Shanghai: $formattedShanghaiTime"
           echo "SHANGHAI_TIMEZONE=$formattedShanghaiTime" >> $env:GITHUB_ENV
 
-      - name: Create release and upload asset
+      - name: 创建 release 并上传安装包
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ env.FIRST_VERSION }}.${{ env.SHANGHAI_TIMEZONE }}.${{ env.HASH_VERSION }}
-          tag_name: ${{ env.FIRST_VERSION }}.${{ env.HASH_VERSION }}
+          name: ${{ steps.build.outputs.app-version }}.${{ env.SHANGHAI_TIMEZONE }}.${{ env.HASH_VERSION }}
+          tag_name: ${{ steps.build.outputs.version }}
           body: ${{ env.RELEASE_BODY }}
           draft: false
           prerelease: false
